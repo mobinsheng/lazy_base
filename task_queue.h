@@ -27,7 +27,10 @@ public:
 
     // 重载函数调用运算符,直接调用run
     void operator()() { run(); }
-
+    
+    // 唯一标识
+    uint64_t id = static_cast<uint64_t>(-1);
+    
     // is sync task
     // 是否为同步任务
     bool is_sync = false;
@@ -36,8 +39,18 @@ public:
     // 任务是否执行结束
     bool finished = false;
     
-    // 任务的执行时间，异步任务使用
-    int64_t invoke_ms = 0;
+    // 异步任务 -- begin
+    
+    // 投递到任务队列的时刻
+    int64_t post_time_ms = 0;
+    
+    // 延迟执行的时间
+    uint32_t delay_ms = 0;
+    
+    // 是否循环执行/周期执行（定时器），异步任务使用
+    bool loop = false;
+    
+    // 异步任务 -- end
 private:
     QueuedTask(const QueuedTask&) = delete;
 };
@@ -186,28 +199,86 @@ public:
     
     // 添加异步任务，和post效果一样
     template <class Closure>
-    void add_task(Closure&& closure) {
+    void add_task(Closure&& closure, uint64_t id = INVALID_ID) {
         post_delayed(std::forward<Closure>(closure), 0);
     }
     
     // 添加异步任务，和add_task效果一样
     template <class Closure>
-    void post(Closure&& closure) {
+    void post(Closure&& closure, uint64_t id = INVALID_ID) {
         post_delayed(std::forward<Closure>(closure), 0);
     }
     
     // 添加带延迟的异步任务
     template <class Closure>
-    void post_delayed(Closure&& closure, uint32_t delay_ms) {
+    void post_delayed(Closure&& closure, uint32_t delay_ms, uint64_t id = INVALID_ID) {
         maybe_create_thread();
 
         std::unique_lock<std::mutex> guard(mutex_);
         std::shared_ptr<QueuedTask> task = MakeSharedClosure<void, Closure>(std::forward<Closure>(closure));
-        if (delay_ms > 0) {
-            task->invoke_ms = TimeUtil::NowMs() + delay_ms;
-        }
-        delayed_task_map_.insert(std::make_pair(task->invoke_ms, std::move(task)));
+        task->finished = false;
+        task->id = id;
+        task->post_time_ms = TimeUtil::NowMs();
+        task->delay_ms = delay_ms;
+        task->is_sync = false;
+        task->loop = false;
+        
+        int64_t target_time_ms = task->post_time_ms + task->delay_ms;
+        
+        delayed_task_map_.insert(std::make_pair(target_time_ms , std::move(task)));
         cond_.notify_one();
+    }
+    
+    // 添加定时器，需要明确指定一个id
+    template <class Closure>
+    bool add_timer(Closure&& closure, uint32_t interval_ms, uint64_t id) {
+        
+        if(interval_ms == 0 || id == INVALID_ID){
+            return false;
+        }
+        
+        maybe_create_thread();
+        
+        std::unique_lock<std::mutex> guard(mutex_);
+        std::shared_ptr<QueuedTask> task = MakeSharedClosure<void, Closure>(std::forward<Closure>(closure));
+        task->finished = false;
+        task->id = id;
+        task->post_time_ms = TimeUtil::NowMs();
+        task->delay_ms = interval_ms;
+        task->is_sync = false;
+        task->loop = true;
+        
+        int64_t target_time_ms = task->post_time_ms + task->delay_ms;
+        
+        delayed_task_map_.insert(std::make_pair(target_time_ms, std::move(task)));
+        cond_.notify_one();
+        
+        return true;
+    }
+    
+    // 移除定时器
+    void remove_timer(uint64_t id) {
+        std::unique_lock<std::mutex> guard(mutex_);
+        
+        if(id == INVALID_ID){
+            return;
+        }
+        
+        for(auto it = delayed_task_map_.begin(); it != delayed_task_map_.end();){
+            if(it->second == nullptr){
+                ++it;
+                continue;
+            }
+            
+            if(it->second->id == id){
+                assert(it->second->loop == true);
+                it = delayed_task_map_.erase(it);
+                break;
+            }
+            else {
+                ++it;
+            }
+        }
     }
 
     // 执行同步任务
@@ -216,7 +287,13 @@ public:
         maybe_create_thread();
 
         std::shared_ptr<QueuedTask> task = MakeSharedClosure<ReturnT, Closure>(std::forward<Closure>(closure));
+        task->finished = false;
+        task->id = INVALID_ID;
+        task->post_time_ms = 0;
+        task->delay_ms = 0;
         task->is_sync = true;
+        task->loop = false;
+        
         {
             std::unique_lock<std::mutex> guard(mutex_);
             task_list_.push_back(task);
@@ -335,8 +412,21 @@ private:
                 task->finished = true;
                 sync_cond_.notify_all();
             }
+            
+            if(!flush_ && task->loop && task->delay_ms > 0){
+                task->post_time_ms = TimeUtil::NowMs();
+                
+                uint64_t target_time_ms = task->post_time_ms + task->delay_ms;
+                
+                std::unique_lock<std::mutex> guard(mutex_);
+                
+                delayed_task_map_.insert(std::make_pair(target_time_ms, std::move(task)));
+            }
         }
     }
+    
+    const static uint64_t INVALID_ID= static_cast<uint64_t>(-1);
+    
 
     std::mutex mutex_;
     std::condition_variable cond_;

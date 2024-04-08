@@ -15,8 +15,8 @@
 #include "time_utils.h"
 #include "test_log.h"
 #include "test_global_config.h"
-#include "test_random.h"
-#include "test_ringbuffer.h"
+//#include "test_random.h"
+//#include "test_ringbuffer.h"
 
 static lazy::TaskQueue task_queue;
 
@@ -42,7 +42,9 @@ int main(int argc, const char * argv[]) {
     
     TestRandom();*/
     
-    TestRingbuffer();
+    //TestRingbuffer();
+
+    Testlog();
     
     return 0;
 }

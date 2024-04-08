@@ -108,7 +108,7 @@ void TestPost(){
     std::thread t1([&]{
         for(int i = 0; i < 1024; ++i){
             sender.send();
-            lazy::TimeUtil::SleepMs(100);
+            lazy::TimeUtil::SleepMs(10);
         }
         
         sender.stop();

@@ -8,6 +8,8 @@
 #include <chrono>
 #include <thread>
 
+#include "lazy_base_common.h"
+
 // Time Utils
 
 namespace lazy {

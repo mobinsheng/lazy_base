@@ -9,6 +9,8 @@
 #include <condition_variable>
 #include <chrono>
 
+#include "lazy_base_common.h"
+
 namespace lazy {
 
 /**
@@ -25,9 +27,6 @@ public:
     
     ~Event(){
     }
-    
-    Event(const Event&) = delete;
-    Event& operator=(const Event&) = delete;
     
     bool wait(int32_t timeout_ms = -1){
         std::unique_lock<std::mutex> lock(mutex_);
@@ -62,6 +61,8 @@ private:
     std::condition_variable cond_;
     
     State state_ = STATE_WAIT;
+    
+    LAZY_DISALLOW_COPY_AND_ASSIGN(Event);
 };
 
 }

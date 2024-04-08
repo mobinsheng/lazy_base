@@ -17,6 +17,8 @@
 #include <atomic>
 #include <map>
 
+#include "lazy_base_common.h"
+
 #include "time_utils.h"
 
 namespace lazy {
@@ -31,7 +33,7 @@ public:
     void operator()() { run(); }
     
     // 唯一标识
-    uint64_t id = static_cast<uint64_t>(-1);
+    uint64_t task_id = static_cast<uint64_t>(-1);
     
     // is sync task
     // 是否为同步任务
@@ -44,13 +46,16 @@ public:
     // 异步任务 -- begin
     
     // 投递到任务队列的时刻
-    int64_t post_time_ms = 0;
+    int64_t enqueue_time_ms = 0;
     
     // 延迟执行的时间
     uint32_t delay_ms = 0;
     
-    // 是否循环执行/周期执行（定时器），异步任务使用
-    bool loop = false;
+    // 下面两个用于指定重复执行
+    // 循环/重复次数，等于0表示不重复（只执行一次）,等于-1表示无限循环（定时器），大于0表示循环/重复指定次数
+    uint64_t repeat_num = 0;
+    // 当前已经执行的次数
+    uint64_t invoke_count = 0;
     
     // 异步任务 -- end
 private:
@@ -163,68 +168,48 @@ public:
     
     // 添加异步任务，和post效果一样
     template <class Closure>
-    void add_task(Closure&& closure, uint64_t id = INVALID_ID) {
-        post_delayed(std::forward<Closure>(closure), 0);
+    void add_task(Closure&& closure, uint64_t task_id = INVALID_ID) {
+        // 最后一个参数(repeat_num)等于0表示不是重复任务
+        post_delayed_internal(std::forward<Closure>(closure), 0, task_id, 0);
     }
     
     // 添加异步任务，和add_task效果一样
     template <class Closure>
-    void post(Closure&& closure, uint64_t id = INVALID_ID) {
-        post_delayed(std::forward<Closure>(closure), 0);
+    void post(Closure&& closure, uint64_t task_id = INVALID_ID) {
+        // 最后一个参数(repeat_num)等于0表示不是重复任务
+        post_delayed_internal(std::forward<Closure>(closure), 0, task_id, 0);
     }
     
-    // 添加带延迟的异步任务
+    /* 添加带延迟的异步任务
+     * closure: 可执行对象
+     * delay_or_interval_ms: 延迟执行的时间
+     * task_id: 任务ID，通过cancel接口可以取消
+     */
     template <class Closure>
-    void post_delayed(Closure&& closure, uint32_t delay_ms, uint64_t id = INVALID_ID) {
-        maybe_create_thread();
-
-        std::unique_lock<std::mutex> guard(mutex_);
-        std::shared_ptr<QueuedTask> task = MakeSharedClosure<void, Closure>(std::forward<Closure>(closure));
-        task->finished = false;
-        task->id = id;
-        task->post_time_ms = TimeUtil::NowMs();
-        task->delay_ms = delay_ms;
-        task->is_sync = false;
-        task->loop = false;
-        
-        int64_t target_time_ms = task->post_time_ms + task->delay_ms;
-        
-        delayed_task_map_.insert(std::make_pair(target_time_ms , std::move(task)));
-        cond_.notify_one();
+    void post_delayed(Closure&& closure, uint32_t delay_or_interval_ms, uint64_t task_id = INVALID_ID) {
+        post_delayed_internal(std::forward<Closure>(closure), delay_or_interval_ms, task_id, 0);
     }
     
-    // 添加定时器，需要明确指定一个id
+    /* 添加带延迟的异步任务
+     * closure: 可执行对象
+     * delay_or_interval_ms: 延迟执行的时间
+     * task_id: 任务ID，通过cancel接口可以取消
+     * repeat_num: 重复次数，默认是0表示不重复，等于-1表示无限重复/循环，大于0表示重复指定次数
+     */
     template <class Closure>
-    bool add_timer(Closure&& closure, uint32_t interval_ms, uint64_t id) {
-        
-        if(interval_ms == 0 || id == INVALID_ID){
-            return false;
-        }
-        
-        maybe_create_thread();
-        
-        std::unique_lock<std::mutex> guard(mutex_);
-        std::shared_ptr<QueuedTask> task = MakeSharedClosure<void, Closure>(std::forward<Closure>(closure));
-        task->finished = false;
-        task->id = id;
-        task->post_time_ms = TimeUtil::NowMs();
-        task->delay_ms = interval_ms;
-        task->is_sync = false;
-        task->loop = true;
-        
-        int64_t target_time_ms = task->post_time_ms + task->delay_ms;
-        
-        delayed_task_map_.insert(std::make_pair(target_time_ms, std::move(task)));
-        cond_.notify_one();
-        
-        return true;
+    void post_delayed_and_repeat(Closure&& closure,
+                                 uint32_t delay_or_interval_ms,
+                                 uint64_t task_id,
+                                 uint64_t repeat_num) {
+        post_delayed_internal(std::forward<Closure>(closure), delay_or_interval_ms, task_id, repeat_num);
     }
     
-    // 移除定时器
-    void remove_timer(uint64_t id) {
+    // 取消一个异步任务
+    // 对于周期性执行的任务（定时器），最好指定一个id，这样方便取消
+    void cancel(uint64_t task_id){
         std::unique_lock<std::mutex> guard(mutex_);
         
-        if(id == INVALID_ID){
+        if(task_id == INVALID_ID){
             return;
         }
         
@@ -234,8 +219,8 @@ public:
                 continue;
             }
             
-            if(it->second->id == id){
-                assert(it->second->loop == true);
+            if(it->second->task_id == task_id){
+                assert(it->second->repeat_num != 0);
                 it = delayed_task_map_.erase(it);
                 break;
             }
@@ -243,6 +228,24 @@ public:
                 ++it;
             }
         }
+    }
+    
+    // 添加定时器，需要明确指定一个id
+    template <class Closure>
+    bool add_timer(Closure&& closure, uint32_t interval_ms, uint64_t task_id) {
+        
+        if(interval_ms == 0 || task_id == INVALID_ID){
+            return false;
+        }
+        
+        post_delayed_internal(std::forward<Closure>(closure), interval_ms, task_id, -1);
+        
+        return true;
+    }
+    
+    // 移除定时器
+    void remove_timer(uint64_t task_id) {
+        return cancel(task_id);
     }
 
     // 执行同步任务
@@ -252,11 +255,11 @@ public:
 
         std::shared_ptr<QueuedTask> task = MakeSharedClosure<ReturnT, Closure>(std::forward<Closure>(closure));
         task->finished = false;
-        task->id = INVALID_ID;
-        task->post_time_ms = 0;
+        task->task_id = INVALID_ID;
+        task->enqueue_time_ms = 0;
         task->delay_ms = 0;
         task->is_sync = true;
-        task->loop = false;
+        task->repeat_num = 0;
         
         {
             std::unique_lock<std::mutex> guard(mutex_);
@@ -276,6 +279,27 @@ public:
         return ptr->move_result();
     }
 private:
+    // 添加异步任务的公共接口
+    template <class Closure>
+    void post_delayed_internal(Closure&& closure, uint32_t delay_or_interval_ms, uint64_t task_id = INVALID_ID, uint64_t repeat_num = -1) {
+        maybe_create_thread();
+
+        std::unique_lock<std::mutex> guard(mutex_);
+        std::shared_ptr<QueuedTask> task = MakeSharedClosure<void, Closure>(std::forward<Closure>(closure));
+        task->finished = false;
+        task->task_id = task_id;
+        task->enqueue_time_ms = TimeUtil::NowMs();
+        task->delay_ms = delay_or_interval_ms;
+        task->is_sync = false;
+        task->repeat_num = repeat_num;
+        task->invoke_count = 0;
+        assert(task->repeat_num >= task->invoke_count);
+        
+        int64_t target_time_ms = task->enqueue_time_ms + task->delay_ms;
+        
+        delayed_task_map_.insert(std::make_pair(target_time_ms , std::move(task)));
+        cond_.notify_one();
+    }
     
     // 创建任务队列线程
     void maybe_create_thread() {
@@ -377,14 +401,21 @@ private:
                 sync_cond_.notify_all();
             }
             
-            if(!flush_ && task->loop && task->delay_ms > 0){
-                task->post_time_ms = TimeUtil::NowMs();
+            // 如果是重复任务
+            if(!flush_ && task->repeat_num != 0 && task->delay_ms > 0){
                 
-                uint64_t target_time_ms = task->post_time_ms + task->delay_ms;
+                ++task->invoke_count;
                 
-                std::unique_lock<std::mutex> guard(mutex_);
-                
-                delayed_task_map_.insert(std::make_pair(target_time_ms, std::move(task)));
+                if(task->invoke_count < task->repeat_num){
+                    
+                    task->enqueue_time_ms = TimeUtil::NowMs();
+                    
+                    uint64_t target_time_ms = task->enqueue_time_ms + task->delay_ms;
+                    
+                    std::unique_lock<std::mutex> guard(mutex_);
+                    
+                    delayed_task_map_.insert(std::make_pair(target_time_ms, std::move(task)));
+                }
             }
         }
     }
@@ -407,7 +438,28 @@ private:
     bool flush_ = false;
 
     std::string name_ = "";
+    
+    LAZY_DISALLOW_COPY_AND_ASSIGN(TaskQueue);
 };
+
+// 以同步的方式把任务/函数放到任务队列中执行，并等待执行结束
+/* 用法如下：
+ 
+ TaskQueue task_queue;
+ 
+ int add(int a, int b) {
+    RUN_ON_TASK_QUEUE(int, add, a, b);
+    
+    return (a+b);
+ }
+ 
+ */
+#define RUN_ON_TASK_QUEUE(RET, func, task_queue, ...)       \
+    if(!task_queue.is_current()) {                          \
+        return task_queue.invoke<RET>([&]{                  \
+            return (func)(__VA_ARGS__);                     \
+        });                                                 \
+    }
 
 }
 

@@ -9,12 +9,21 @@
 #include <mutex>
 #include <condition_variable>
 
+#include "lazy_base_common.h"
+
 namespace lazy {
 
 
 template<class T>
 class DataQueue {
 public:
+    DataQueue(){
+        
+    }
+    
+    ~DataQueue(){
+        stop();
+    }
     
     bool push_back(const T& val) {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -22,6 +31,17 @@ public:
             return false;
         }
         queue_.push_back(val);
+        cond_.notify_all();
+        
+        return true;
+    }
+    
+    bool emplace_back(T&& val) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if(stop_){
+            return false;
+        }
+        queue_.emplace_back(std::forward<T>(val));
         cond_.notify_all();
         
         return true;
@@ -96,11 +116,13 @@ public:
     }
     
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cond_;
     
     std::deque<T> queue_;
     bool stop_ = false;
+    
+    LAZY_DISALLOW_COPY_AND_ASSIGN(DataQueue);
 };
 
 }

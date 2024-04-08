@@ -43,11 +43,8 @@ void TestInvoke(){
         
         bool Write(const uint8_t* data, size_t size){
             // 判断当前所在线程和任务队列的线程是否为同一个
-            if(!task_queue_.is_current()){
-                return task_queue_.invoke<bool>([&]{
-                    return Write(data, size);
-                });
-            }
+
+            RUN_ON_TASK_QUEUE(bool, Write, task_queue_, data, size);
             
             if(data == nullptr || size == 0){
                 return false;
